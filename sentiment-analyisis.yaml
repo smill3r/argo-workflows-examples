@@ -1,0 +1,205 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: sentiment-analysis-workflow-
+spec:
+  entrypoint: main
+
+  arguments:
+    parameters:
+      - name: config
+        value: |
+          {
+            "reddit_client_id": "",
+            "reddit_client_secret": "",
+            "reddit_user_agent": "",
+            "subreddits": ["politics"],
+            "keywords": ["spain"],
+            "limit": 1
+          }
+
+  templates:
+    - name: main
+      dag:
+        tasks:
+          # Step 1: Convert config parameter to a JSON artifact
+          - name: config-to-artifact
+            template: generate-config-artifact
+            arguments:
+              parameters:
+                - name: config
+                  value: "{{workflow.parameters.config}}"
+
+          # Step 2: Collect data
+          - name: collect-data
+            dependencies: [config-to-artifact]
+            template: reddit-collector
+            arguments:
+              artifacts:
+                - name: config-json
+                  from: "{{tasks.config-to-artifact.outputs.artifacts.config-json}}"
+
+          # Step 3: Split CSV
+          - name: split-data
+            dependencies: [collect-data]
+            template: split-csv
+            arguments:
+              artifacts:
+                - name: collected-csv
+                  from: "{{tasks.collect-data.outputs.artifacts.collected-csv}}"
+
+          # Step 4: Generate list of split files
+          - name: generate-split-json
+            dependencies: [split-data]
+            template: generate-split-json
+            arguments:
+              artifacts:
+                - name: split-folder
+                  from: "{{tasks.split-data.outputs.artifacts.split-folder}}"
+
+          # Step 5: Sentiment analysis fan-out
+          - name: sentiment-analysis
+            dependencies: [generate-split-json]
+            template: sentiment-analysis
+            arguments:
+              parameters:
+                - name: input-path
+                  value: "{{item}}"
+              artifacts:
+                - name: split-folder
+                  from: "{{tasks.split-data.outputs.artifacts.split-folder}}"
+            withParam: "{{tasks.generate-split-json.outputs.parameters.split-file-list}}"
+
+          # Step 6: Join CSVs
+          - name: join-data
+            dependencies: [ sentiment-analysis ]
+            template: join-csv
+
+    # ----------------------------
+    # Templates
+    # ----------------------------
+    - name: generate-config-artifact
+      inputs:
+        parameters:
+          - name: config
+      outputs:
+        artifacts:
+          - name: config-json
+            path: /data/comments.json
+      container:
+        image: alpine:3.18
+        command: [sh, -c]
+        args:
+          - "echo '{{inputs.parameters.config}}' > /data/comments.json"
+        volumeMounts:
+          - name: workdir
+            mountPath: /data
+      volumes:
+        - name: workdir
+          emptyDir: {}
+
+    - name: reddit-collector
+      inputs:
+        artifacts:
+          - name: config-json
+            path: /data/comments.json
+      outputs:
+        artifacts:
+          - name: collected-csv
+            path: /data/output/comments.csv
+      container:
+        image: o4tmeal/reddit-collector-sync:arm64
+        command: ["python", "recolectar_datos.py"]
+        args: ["/data/comments.json", "/data/output"]
+        env:
+          - name: reddit_client_id
+            value: "{{=jsonpath(workflow.parameters['config'], '$.reddit_client_id')}}"
+          - name: reddit_client_secret
+            value: "{{=jsonpath(workflow.parameters['config'], '$.reddit_client_secret')}}"
+        volumeMounts:
+          - name: workdir
+            mountPath: /data
+      volumes:
+        - name: workdir
+          emptyDir: {}
+
+    - name: split-csv
+      inputs:
+        artifacts:
+          - name: collected-csv
+            path: /data/input/comments.csv
+      outputs:
+        artifacts:
+          - name: split-folder
+            path: /data/output
+      container:
+        image: o4tmeal/split-csv:arm64
+        command: ["python", "split-csv.py"]
+        args: ["/data/input/comments.csv", "/data/output", "40"]
+        volumeMounts:
+          - name: workdir
+            mountPath: /data
+      volumes:
+        - name: workdir
+          emptyDir: {}
+
+    - name: generate-split-json
+      inputs:
+        artifacts:
+          - name: split-folder
+            path: /data/splits
+      outputs:
+        parameters:
+          - name: split-file-list
+            valueFrom:
+              path: /tmp/split-file-list.json
+      container:
+        image: python:3.9-slim
+        command: [ python, -c ]
+        args:
+          - |
+            import os, json
+            folder = "/data/splits/comments"
+            files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".csv")]
+            with open("/tmp/split-file-list.json", "w") as f:
+                json.dump(files, f)
+      volumes:
+        - name: workdir
+          emptyDir: {}
+
+    - name: sentiment-analysis
+      inputs:
+        parameters:
+          - name: input-path
+        artifacts:
+          - name: split-folder
+            path: /data/splits
+      outputs:
+        artifacts:
+          - name: results
+            path: /data/output
+      container:
+        image: o4tmeal/roberta-sentiment-analysis:arm64
+        args: ["--column", "comment", "{{inputs.parameters.input-path}}", "/data/output"]
+        volumeMounts:
+          - name: workdir
+            mountPath: /data
+      volumes:
+        - name: workdir
+          emptyDir: {}
+
+    - name: join-csv
+      outputs:
+        artifacts:
+          - name: final-result
+            path: /data/output/comments.csv
+      container:
+        image: o4tmeal/join-csv:arm64
+        command: [ "python", "join-csv.py" ]
+        args: [ "/data/output", "/data/output/comments.csv" ]
+        volumeMounts:
+          - name: workdir
+            mountPath: /data
+      volumes:
+        - name: workdir
+          emptyDir: { }
