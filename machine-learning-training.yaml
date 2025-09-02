@@ -5,190 +5,174 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Workflow
 metadata:
-  generateName: minio-image-workflow-
+  generateName: ml-pipeline-
 spec:
-  entrypoint: image-workflow
+  entrypoint: ml-workflow
+  volumeClaimTemplates:
+    - metadata:
+        name: data-volume
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+  arguments:
+    parameters:
+      - name: iteration
+        value: "0"
   templates:
-    - name: image-workflow
-      steps:
-        - - name: download-images
-            template: download-images
-        - - name: preprocess-images
-            template: preprocess-images
+    - name: ml-workflow
+      dag:
+        tasks:
+          - name: fetch-data
+            template: fetch-data
+            when: "{{workflow.parameters.iteration}} == 0"
+          - name: data-preprocessing
+            template: data-preprocess
+            dependencies: [fetch-data]
+            when: "{{workflow.parameters.iteration}} == 0"
+          - name: model-training
+            template: train-model
+            dependencies: [data-preprocessing]
+          - name: model-evaluation
+            template: evaluate-model
+            dependencies: [model-training]
+          - name: accuracy-check
+            template: check-accuracy
+            dependencies: [model-evaluation]
             arguments:
-              artifacts:
-                - name: images
-                  from: "{{steps.download-images.outputs.artifacts.images}}"
-        - - name: process-images
-            template: process-images
-            arguments:
-              artifacts:
-                - name: images
-                  from: "{{steps.preprocess-images.outputs.artifacts.images}}"
-        - - name: classify-images
-            template: classify-images
-            arguments:
-              artifacts:
-                - name: images
-                  from: "{{steps.process-images.outputs.artifacts.images}}"
-        - - name: upload-results
-            template: upload-results
-            arguments:
-              artifacts:
-                - name: results
-                  from: "{{steps.classify-images.outputs.artifacts.results}}"
+              parameters:
+                - name: test-accuracy
+                  value: "{{tasks.model-evaluation.outputs.parameters.test-accuracy}}"
+                - name: iteration
+                  value: "{{workflow.parameters.iteration}}"
 
-    # Step 1: Download images from MinIO
-    - name: download-images
-      outputs:
-        artifacts:
-          - name: images
-            path: /tmp/images
+    # Step 0: Fetch input CSV from MinIO
+    - name: fetch-data
       container:
         image: minio/mc
         envFrom:
           - secretRef:
               name: minio-secret
-        command: [sh, -c]
+        command: ["sh", "-c"]
         args:
           - |
-            mkdir -p /tmp/images
             mc alias set myminio "$MINIO_SERVER_HOST" "$MINIO_SERVER_ACCESS_KEY" "$MINIO_SERVER_SECRET_KEY"
-            mc cp --recursive myminio/argo-workflows/images/ /tmp/images
+            mc cp myminio/yashod-ml/input.csv /mnt/data/input.csv
+        volumeMounts:
+          - name: data-volume
+            mountPath: /mnt/data
 
-    # Step 2: Preprocess images
-    - name: preprocess-images
-      inputs:
-        artifacts:
-          - name: images
-            path: /tmp/images
-      outputs:
-        artifacts:
-          - name: images
-            path: /tmp/preprocessed
+    # Step 1: Preprocess data
+    - name: data-preprocess
       container:
         image: bitnami/python:latest
-        command: [ sh, -c ]
+        command: ["sh", "-c"]
         args:
           - |
-            pip install --no-cache-dir pillow && \
-            python3 -u -c "
-            import os
-            from PIL import Image
-            input_dir = '/tmp/images'
-            output_dir = '/tmp/preprocessed'
-            os.makedirs(output_dir, exist_ok=True)
-            for f in os.listdir(input_dir):
-                if f.endswith('.jpg') or f.endswith('.png'):
-                    img = Image.open(os.path.join(input_dir, f))
-                    img = img.resize((256, 256))
-                    img.save(os.path.join(output_dir, f))
-            "
+            pip install --no-cache-dir pandas && \
+            python - <<'EOF'
+            import pandas as pd
+            df = pd.read_csv('/mnt/data/input.csv')
+            df_cleaned = df.dropna()
+            df_cleaned.to_csv('/mnt/data/cleaned_data.csv', index=False)
+            EOF
+        volumeMounts:
+          - name: data-volume
+            mountPath: /mnt/data
 
-    # Step 3: Process images (convert to grayscale)
-    - name: process-images
-      inputs:
-        artifacts:
-          - name: images
-            path: /tmp/preprocessed
-      outputs:
-        artifacts:
-          - name: images
-            path: /tmp/processed
+    # Step 2: Train model
+    - name: train-model
       container:
         image: bitnami/python:latest
-        command: [ sh, -c ]
+        command: ["sh", "-c"]
         args:
           - |
-            pip install --no-cache-dir pillow && \
-            python3 -u -c "
-            import os
-            from PIL import Image
-            input_dir = '/tmp/preprocessed'
-            output_dir = '/tmp/processed'
-            os.makedirs(output_dir, exist_ok=True)
-            for f in os.listdir(input_dir):
-                if f.endswith('.jpg') or f.endswith('.png'):
-                    img = Image.open(os.path.join(input_dir, f))
-                    img = img.convert('L')
-                    img.save(os.path.join(output_dir, f))
-            "
+            pip install --no-cache-dir pandas scikit-learn joblib && \
+            python - <<'EOF'
+            import pandas as pd
+            from sklearn.model_selection import train_test_split
+            from sklearn.ensemble import RandomForestClassifier
+            import joblib
+            
+            df = pd.read_csv('/mnt/data/cleaned_data.csv')
+            X = df.drop('target', axis=1)
+            y = df['target']
+            
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+            model = RandomForestClassifier()
+            model.fit(X_train, y_train)
+            joblib.dump(model, '/mnt/data/model.joblib')
+            EOF
+        volumeMounts:
+          - name: data-volume
+            mountPath: /mnt/data
 
-    # Step 3.5: Classify images
-    - name: classify-images
-      inputs:
-        artifacts:
-          - name: images
-            path: /tmp/processed
+    # Step 3: Evaluate model
+    - name: evaluate-model
       outputs:
-        artifacts:
-          - name: results
-            path: /tmp/results
+        parameters:
+          - name: test-accuracy
+            valueFrom:
+              path: /mnt/data/test-accuracy
       container:
         image: bitnami/python:latest
-        command: [ sh, -c ]
+        command: ["sh", "-c"]
         args:
           - |
-            pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
-            python3 -u -c "
-            import os, json
-            from PIL import Image
-            import torch
-            import torchvision.transforms as transforms
-            import torchvision.models as models
+            pip install --no-cache-dir pandas scikit-learn joblib && \
+            python - <<'EOF'
+            import pandas as pd
+            import joblib
+            from sklearn.metrics import accuracy_score
+            
+            model = joblib.load('/mnt/data/model.joblib')
+            df = pd.read_csv('/mnt/data/cleaned_data.csv')
+            X = df.drop('target', axis=1)
+            y = df['target']
+      
+            predictions = model.predict(X)
+            accuracy = accuracy_score(y, predictions)
+            print(f"Model accuracy: {accuracy}")
+            with open("/mnt/data/test-accuracy", "w") as f:
+              f.write(str(accuracy*100))
+            EOF
+        volumeMounts:
+          - name: data-volume
+            mountPath: /mnt/data
 
-            input_dir = '/tmp/processed'
-            output_dir = '/tmp/results'
-            os.makedirs(output_dir, exist_ok=True)
-
-            model = models.resnet18(pretrained=True)
-            model.eval()
-            transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
-
-            # Load ImageNet labels
-            import urllib.request
-            labels_url = 'https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt'
-            class_names = urllib.request.urlopen(labels_url).read().decode('utf-8').splitlines()
-  
-            results = []
-  
-            for f in os.listdir(input_dir):
-              if f.endswith('.jpg') or f.endswith('.png'):
-                img = Image.open(os.path.join(input_dir, f)).convert('RGB')
-                x = transform(img).unsqueeze(0)
-                with torch.no_grad():
-                  y = model(x)
-                cls_id = y.argmax(1).item()
-                cls_name = class_names[cls_id]
-                results.append({
-                'file': f,
-                'class_id': cls_id,
-                'class_name': cls_name
-              })
-  
-            with open(os.path.join(output_dir, 'results.json'), 'w') as out:
-              json.dump(results, out, indent=2)
-            "
-
-    # Step 4: Upload results to MinIO
-    - name: upload-results
+    # Step 4: Check accuracy, loop or upload
+    - name: check-accuracy
       inputs:
-        artifacts:
-          - name: results
-            path: /tmp/results
+        parameters:
+          - name: test-accuracy
+          - name: iteration
+      dag:
+        tasks:
+          - name: upload-if-good
+            template: store-model
+            when: "{{inputs.parameters.test-accuracy}} >= 87"
+          - name: retrain
+            template: ml-workflow
+            when: "{{inputs.parameters.test-accuracy}} < 87 && {{inputs.parameters.iteration}} < 5"
+            arguments:
+              parameters:
+                - name: iteration
+                  value: "{{=asInt(inputs.parameters.iteration) + 1}}"
+
+    # Step 5: Store model in MinIO
+    - name: store-model
       container:
         image: minio/mc
         envFrom:
           - secretRef:
               name: minio-secret
-        command: [sh, -c]
+        command: ["sh", "-c"]
         args:
           - |
+            echo "Uploading final model..."
             mc alias set myminio "$MINIO_SERVER_HOST" "$MINIO_SERVER_ACCESS_KEY" "$MINIO_SERVER_SECRET_KEY"
-            mc cp --recursive /tmp/results/ myminio/argo-workflows/results/{{workflow.name}}
+            mc cp /mnt/data/model.joblib myminio/yashod-ml/model.joblib
+        volumeMounts:
+          - name: data-volume
+            mountPath: /mnt/data
